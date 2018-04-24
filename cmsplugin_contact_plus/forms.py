@@ -1,6 +1,7 @@
+from django.template import TemplateDoesNotExist
 from django.utils.http import urlquote
 from django import forms
-from django.core.mail import EmailMessage
+from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.contrib.sites.models import Site
 from django.template.defaultfilters import slugify
@@ -12,6 +13,7 @@ from simplemathcaptcha.fields import MathCaptchaField
 from cmsplugin_contact_plus.models import ContactPlus, ContactRecord
 from cmsplugin_contact_plus.signals import contact_message_sent
 from cmsplugin_contact_plus.utils import get_validators
+from cmsplugin_contact_plus import local_settings
 
 class ContactFormPlus(forms.Form):
     required_css_class = getattr(settings, 'CONTACT_PLUS_REQUIRED_CSS_CLASS', 'required')
@@ -130,14 +132,8 @@ class ContactFormPlus(forms.Form):
                         required=extraField.required,
                         validators=get_validators())
 
-                if slugify(extraField.label) in self.fields:
-                    tags = ([t.strip() for t in extraField.tags.split(',')]
-                        if extraField.tags else [])
-                    self.fields[slugify(extraField.label)].tags = tags
-
-
     def send(self, recipient_email, request, ts, instance=None, multipart=False):
-        current_site = Site.objects.get_current()
+        current_site = Site.objects.get_current(request=request)
         ordered_dic_list = []
 
         if instance:
@@ -181,21 +177,42 @@ class ContactFormPlus(forms.Form):
             if getattr(settings, 'CONTACT_PLUS_SEND_COPY_TO_REPLY_EMAIL', False):
                 cc_list.append(reply_email)
 
-        email_message = EmailMessage(
+        template_context = {
+            'data': self.cleaned_data,
+            'ordered_data': ordered_dic_list,
+            'instance': instance,
+        }
+
+        template_name = instance.email_template if instance else "cmsplugin_contact_plus/email.txt"
+
+        email_message = EmailMultiAlternatives(
             subject=instance.email_subject,
-            body=render_to_string("cmsplugin_contact_plus/email.txt", {'data': self.cleaned_data,
-                                                                      'ordered_data': ordered_dic_list,
-                                                                      'instance': instance,
-                                                                      }),
+            body=render_to_string(template_name, template_context),
             cc=cc_list,
             from_email=getattr(settings, 'CONTACT_PLUS_FROM_EMAIL', settings.DEFAULT_FROM_EMAIL),
-            to=[recipient_email, ],
+            to=[recipient_email],
             headers=email_headers,
         )
+
+        if instance:
+            template = local_settings.CONTACT_PLUS_EMAIL_TEMPLATES[instance.email_template]
+
+            if 'html' in template:
+                try:
+                    email_message.attach_alternative(
+                        content=render_to_string(template['html'], template_context),
+                        mimetype='text/html')
+                except TemplateDoesNotExist:
+                    pass
+
         email_message.send(fail_silently=True)
 
-        if instance.collect_records:# and not multipart:
-            record = ContactRecord(contact_form=instance, data=ordered_dic_list)#self.cleaned_data)
+        if instance.collect_records:  # and not multipart:
+            record = ContactRecord(contact_form=instance, data=ordered_dic_list)
             record.save()
 
-        contact_message_sent.send(sender=self, data=self.cleaned_data)
+        contact_message_sent.send(
+            sender=self,
+            data=self.cleaned_data,
+            instance=instance,
+            request=request)
